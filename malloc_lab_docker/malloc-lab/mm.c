@@ -26,7 +26,7 @@
  *
  * 2. 배치 정책(Placement Policy)
  *    - First Fit / Next Fit / Best Fit을 각각 구현하였다.
- *    - 현재 find_fit()에서 First Fit을 선택하여 사용하고 있다.
+ *    - 현재 find_fit()에서 상황에 따라 선택하여 사용하고 있다.
  *
  * 3. 분할(Splitting)
  *    - 찾은 free block이 필요한 크기보다 충분히 크다면
@@ -52,6 +52,7 @@
 #include <assert.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "mm.h"
 #include "memlib.h"
@@ -80,12 +81,16 @@ team_t team = {
  * DSIZE = 8B
  *   Double Word 크기이며 현재 allocator의 정렬 기준으로 사용한다.
  *
- * CHUNKSIZE = 4096B
+ * CHUNKSIZE = 256B
  *   초기 Heap을 확장할 때 사용하는 크기
+ *
+ * 현재 extend_heap()은 바이트 단위 크기를 받는다.
+ * 256B부터 4096B까지 비교한 결과, 256B에서 전체 utilization이
+ * 가장 높았으므로 초기 확장 크기로 선택하였다.
  */
 #define WSIZE       4
 #define DSIZE       8
-#define CHUNKSIZE (1 << 12)
+#define CHUNKSIZE (1 << 8)
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -300,13 +305,13 @@ int mm_init(void)
     heap_listp += (2 * WSIZE);
 
     /*
-     * 빈 Heap에 CHUNKSIZE(4096B) 크기의 free block을 추가한다.
+     * 빈 Heap에 CHUNKSIZE(256B) 크기의 free block을 추가한다.
      */
     if (extend_heap(CHUNKSIZE) == NULL)
         return -1;
 
     /*
-     * Next Fit에서 사용할 rover를 첫 번째 실제 블록 위치로 설정한다.
+     * Next Fit 정책으로 전환할 때 사용할 rover를 첫 번째 실제 블록 위치로 초기화한다.
      */
     rover = NEXT_BLKP(heap_listp);
     return 0;
@@ -396,8 +401,9 @@ static void *coalesce(void *bp)
     size_t size = GET_SIZE(HDRP(bp));
 
     /* Case 1: 이전 allocated, 다음 allocated */
-    if (prev_alloc && next_alloc)
+    if (prev_alloc && next_alloc){
         return bp;
+    }
 
     /* Case 2: 이전 allocated, 다음 free */
     else if (prev_alloc && !next_alloc) {
@@ -444,7 +450,17 @@ static void *coalesce(void *bp)
         /* 병합 후 시작 위치는 이전 block */
         bp = PREV_BLKP(bp);
     }
-
+        /*
+     * 병합으로 기존 블록 경계가 사라지면서 rover가 최종 free block의
+     * 내부를 가리키게 된 경우, 병합된 블록의 시작점으로 보정한다.
+     *
+     * rover == bp이면 이미 유효한 현재 블록의 시작점이고,
+     * rover == NEXT_BLKP(bp)이면 유효한 다음 블록의 시작점이므로
+     * 두 경계는 제외하고 그 사이에 있을 때만 보정한다.
+     */
+    if ( rover && (char *)bp < rover && rover < NEXT_BLKP(bp)){
+        rover = bp;
+    }
     return bp;
 }
 
@@ -507,9 +523,6 @@ static void *find_fit_first(size_t asize)
  * 반환값:
  *   적절한 free block의 bp
  *   찾지 못하면 NULL
- *
- * ※ 현재 find_fit()에서는 First Fit을 사용하므로 이 함수는
- *    정책 비교 실험을 위해 구현해 둔 상태이다.
  */
 static void *find_fit_next(size_t asize)
 {
@@ -581,9 +594,6 @@ static void *find_fit_next(size_t asize)
  * 반환값:
  *   최적의 free block을 찾으면 해당 bp
  *   없으면 NULL
- *
- * ※ 현재 find_fit()에서는 First Fit을 사용하므로 이 함수는
- *    정책 비교 실험을 위해 구현해 둔 상태이다.
  */
 static void *find_fit_best(size_t asize)
 {
@@ -592,8 +602,11 @@ static void *find_fit_best(size_t asize)
     /* 현재까지 찾은 가장 좋은 free block */
     char *best = NULL;
 
-    /* best가 가리키는 block의 크기 */
-    size_t best_size;
+    /*
+     * 아직 후보가 없으므로 size_t의 최댓값으로 시작한다.
+     * 첫 번째 적합 free block은 항상 이 값보다 작으므로 best가 갱신된다.
+     */
+    size_t best_size = SIZE_MAX;
 
     for (; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
         if (GET_ALLOC(HDRP(bp))) {
@@ -608,7 +621,7 @@ static void *find_fit_best(size_t asize)
              * 아직 후보가 없거나,
              * 현재 block이 기존 best보다 작다면 best 갱신
              */
-            if (best == NULL || size < best_size) {
+            if (size < best_size) {
                 best_size = size;
                 best = bp;
             }
@@ -621,8 +634,6 @@ static void *find_fit_best(size_t asize)
 /*
  * find_fit - 실제 mm_malloc()에서 사용할 배치 정책을 선택한다.
  *
- * 현재는 First Fit 사용.
- *
  * 정책을 비교하고 싶다면 아래 반환 함수를 하나씩 변경하여
  * 같은 조건에서 mdriver의 utilization / throughput을 비교할 수 있다.
  *
@@ -632,7 +643,7 @@ static void *find_fit_best(size_t asize)
  */
 static void *find_fit(size_t asize)
 {
-    return find_fit_first(asize);
+    return find_fit_best(asize);
 }
 
 /*
