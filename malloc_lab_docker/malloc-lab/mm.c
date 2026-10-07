@@ -643,7 +643,7 @@ static void *find_fit_best(size_t asize)
  */
 static void *find_fit(size_t asize)
 {
-    return find_fit_best(asize);
+    return find_fit_first(asize);
 }
 
 /*
@@ -883,15 +883,18 @@ void mm_free(void *bp)
  *      - 오른쪽 block이 free이고 두 block의 합이 asize 이상이면
  *        기존 bp를 유지한 채 오른쪽 block을 흡수한다.
  *      - 합친 뒤 16B 이상 남으면 allocated/free block으로 다시 분할한다.
- *      - 오른쪽 block만으로 확장할 수 없으면 새 block을 할당하고,
+ *      - 현재 block 바로 다음이 Epilogue라면 부족한 크기만큼 Heap을
+ *        직접 확장하여 기존 bp를 유지한다.
+ *      - 위 방법으로 제자리 확장할 수 없으면 새 block을 할당하고,
  *        기존 payload를 복사한 뒤 기존 block을 해제한다.
  *
  *   4. 기존 block이 asize 이상인 경우
  *      - 16B 이상 남으면 뒤쪽을 free block으로 분할하고 coalesce한다.
  *      - 16B보다 적게 남으면 분할하지 않고 기존 block 전체를 유지한다.
  *
- * 현재 구현은 오른쪽 free block을 이용한 제자리 확장까지만 지원한다.
- * 왼쪽 free block 활용, 양쪽 동시 확장, Epilogue 직접 확장은 하지 않는다.
+ * 현재 구현은 오른쪽 free block을 이용한 제자리 확장과
+ * Heap 끝에서의 Epilogue 직접 확장을 지원한다.
+ * 왼쪽 free block 활용과 양쪽 free block 동시 확장은 아직 적용하지 않았다.
  *
  * 크기를 나타내는 주요 변수:
  *
@@ -989,7 +992,56 @@ void *mm_realloc(void *bp, size_t size)
             PUT(FTRP(bp), PACK(next_old_asize, 1));
             return bp;
         }
+        /*
+         * 현재 block 바로 다음의 size가 0이면 Epilogue다.
+         * 즉 현재 block이 Heap의 마지막 실제 block이라는 뜻이다.
+         *
+         * 이 경우 새로운 block을 할당하지 않고, 새로 필요한 크기와
+         * 기존 block 크기의 차이만큼 Heap을 직접 확장할 수 있다.
+         *
+         *   확장 전: [현재 ALLOC][Epilogue]
+         *   확장 후: [더 커진 현재 ALLOC][새 Epilogue]
+         *
+         * 기존 bp의 위치가 바뀌지 않으므로 payload 복사도 필요하지 않다.
+         */
+        if (!GET_SIZE(HDRP(NEXT_BLKP(bp)))) {
+            /*
+             * 이미 old_asize만큼의 공간은 확보되어 있으므로
+             * 부족한 크기(asize - old_asize)만 추가로 요청한다.
+             *
+             * mem_sbrk()는 성공하면 확장 전 program break 주소를,
+             * 실패하면 (void *)-1을 반환한다.
+             */
+            void *extend_result = mem_sbrk(asize - old_asize);
 
+            if (extend_result != (void *)-1) {
+                /*
+                 * 실제 Heap 확장에 성공한 뒤에만 metadata를 변경한다.
+                 *
+                 * Header를 먼저 asize로 변경해야 이후 FTRP()와
+                 * NEXT_BLKP()가 확장된 block 크기를 기준으로 계산된다.
+                 */
+                PUT(HDRP(bp), PACK(asize, 1));
+                PUT(FTRP(bp), PACK(asize, 1));
+
+                /* 확장된 Heap의 끝에 새로운 Epilogue Header 생성 */
+                PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));
+
+                /*
+                 * extend_result는 확장 전 program break이며,
+                 * 이전 Epilogue의 가상 bp와 같은 주소다.
+                 *
+                 * rover가 이전 Epilogue를 가리켰다면 그 경계는 확장 후
+                 * allocated block 내부가 되므로 새 Epilogue로 이동시킨다.
+                 * 다른 정상 block을 가리키고 있다면 기존 위치를 유지한다.
+                 */
+                if (rover == extend_result) {
+                    rover = NEXT_BLKP(bp);
+                }
+
+                return bp;
+            }
+        }
         /*
          * 오른쪽 block만으로 제자리 확장이 불가능한 경우:
          * 새 block을 할당하고 기존 payload를 복사한 뒤 기존 block을 해제한다.
