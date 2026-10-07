@@ -40,11 +40,12 @@
  *
  * 6. realloc
  *    - 현재 블록이 충분히 크면 같은 위치에서 유지하거나 남는 공간을 분할한다.
- *    - 더 큰 공간이 필요하고 오른쪽 블록이 free이면 두 블록을 합쳐
- *      제자리에서 확장하며, 남는 공간이 충분하면 다시 free block으로 분할한다.
- *    - 제자리 확장이 불가능하면 새 블록을 할당하고 기존 데이터를 복사한 뒤
- *      기존 블록을 해제한다.
- *    - 왼쪽 free block 활용, 양쪽 동시 확장, Epilogue 직접 확장은 구현하지 않았다.
+ *    - 더 큰 공간이 필요하면 오른쪽 free block, 왼쪽 free block 또는
+ *      양쪽 free block을 활용하여 가능한 경우 Heap 내부에서 확장한다.
+ *    - 현재 block이 Heap의 마지막 실제 block이면 부족한 크기만큼
+ *      Heap을 직접 확장하고 Epilogue를 새 끝으로 이동한다.
+ *    - 인접 block을 이용할 수 없으면 새 block을 할당하고 기존 payload를
+ *      복사한 뒤 기존 block을 해제한다.
  */
 
 #include <stdio.h>
@@ -977,8 +978,19 @@ void *mm_realloc(void *bp, size_t size)
                 PUT(FTRP(free_bp), PACK(adjust_next_old_asize, 0));
 
                 /*
-                 * 분할된 free block의 오른쪽도 free일 수 있으므로 coalesce한다.
-                 * 이렇게 해야 물리적으로 인접한 free block이 따로 남지 않는다.
+                 * 기존 오른쪽 free block을 흡수하면서 rover가 사라진
+                 * block 경계를 가리키게 되었다면 새 free block으로 이동한다.
+                 *
+                 * Header를 asize로 변경한 뒤이므로 NEXT_BLKP(bp)는
+                 * 분할된 새 free block의 bp인 free_bp를 가리킨다.
+                 */
+                if (rover && (char *)bp < rover && rover < (char *)bp + next_old_asize) {
+                    rover = NEXT_BLKP(bp);
+                }
+
+                /*
+                 * 분할된 free block의 오른쪽도 free일 수 있으므로 병합한다.
+                 * rover를 먼저 유효한 block 경계로 옮긴 뒤 coalesce한다.
                  */
                 coalesce(free_bp);
                 return bp;
@@ -990,8 +1002,17 @@ void *mm_realloc(void *bp, size_t size)
              */
             PUT(HDRP(bp), PACK(next_old_asize, 1));
             PUT(FTRP(bp), PACK(next_old_asize, 1));
+
+            /*
+             * rover가 흡수된 오른쪽 block의 경계를 가리켰다면
+             * 합쳐진 allocated block의 다음 물리적 block으로 이동한다.
+             */
+            if (rover && (char *)bp < rover && rover < (char *)bp + next_old_asize) {
+                rover = NEXT_BLKP(bp);
+            }
             return bp;
-        }
+        }      
+
         /*
          * 현재 block 바로 다음의 size가 0이면 Epilogue다.
          * 즉 현재 block이 Heap의 마지막 실제 block이라는 뜻이다.
@@ -1042,6 +1063,166 @@ void *mm_realloc(void *bp, size_t size)
                 return bp;
             }
         }
+
+        /*
+         * 왼쪽-only 확장에 사용할 이전/다음 block의 bp를 저장한다.
+         *
+         * 다음 block이 allocated이고 이전 block이 free인 경우,
+         * 이전 block과 현재 block을 합쳐 요청 크기를 확보할 수 있는지 확인한다.
+         * Epilogue도 alloc bit가 1이므로 이 조건에 포함된다.
+         *
+         *   확장 전:
+         *     [왼쪽 FREE][현재 ALLOC][오른쪽 ALLOC 또는 Epilogue]
+         *
+         *   확장 후:
+         *     [새 ALLOC][남은 FREE][오른쪽 ALLOC 또는 Epilogue]
+         */
+        void *prev_bp = PREV_BLKP(bp);
+        void *next_bp = NEXT_BLKP(bp);
+
+        if (!GET_ALLOC(HDRP(prev_bp))
+            && GET_ALLOC(HDRP(next_bp))
+            && GET_SIZE(HDRP(prev_bp)) + old_asize >= asize) {
+            /* 이전 free block과 현재 block을 합친 전체 크기 */
+            size_t combined_size = GET_SIZE(HDRP(prev_bp)) + old_asize;
+
+            /* 요청 크기만큼 사용한 뒤 남는 크기 */
+            size_t remainder = combined_size - asize;
+
+            /*
+             * 병합 후 block의 시작 주소는 prev_bp로 이동한다.
+             * 기존 payload를 낮은 주소로 옮겨야 하며 원본과 목적지 범위가
+             * 겹칠 수 있으므로 memcpy()가 아닌 memmove()를 사용한다.
+             *
+             * metadata를 먼저 기록하면 기존 payload 일부를 덮어쓸 수 있으므로
+             * 반드시 payload 이동을 먼저 끝낸다.
+             */
+            memmove(prev_bp, bp, old_asize - DSIZE);
+
+            if (remainder >= 2 * DSIZE) {
+                /*
+                 * 16바이트 이상 남으면 앞쪽은 요청 크기의 allocated block,
+                 * 뒤쪽은 남은 크기의 free block으로 분할한다.
+                 */
+
+                /* 앞쪽 allocated block의 Header/Footer */
+                PUT(HDRP(prev_bp), PACK(asize, 1));
+                PUT(FTRP(prev_bp), PACK(asize, 1));
+
+                /*
+                 * 남은 free block의 Header는 새 allocated block 바로 뒤에 있고,
+                 * Footer는 다음 allocated block의 Header 바로 앞에 있다.
+                 */
+                PUT(HDRP(prev_bp) + asize, PACK(remainder, 0));
+                PUT(HDRP(next_bp) - WSIZE, PACK(remainder, 0));
+            }
+            else {
+                /*
+                 * 남는 공간이 16바이트보다 작으면 독립적인 free block으로
+                 * 만들 수 없으므로 합친 전체 공간을 allocated로 사용한다.
+                 */
+                PUT(HDRP(prev_bp), PACK(combined_size, 1));
+                PUT(HDRP(next_bp) - WSIZE, PACK(combined_size, 1));
+            }
+
+            /*
+             * 병합 전 block 경계가 사라지면서 rover가 새 allocated block
+             * 내부를 가리키게 된 경우, 새 block의 다음 경계로 이동시킨다.
+             *
+             * 분할했다면 새 free block을, 분할하지 않았다면 기존 next_bp를
+             * 가리키게 된다.
+             */
+            if (rover
+                && (char *)prev_bp < rover
+                && rover < (char *)next_bp) {
+                rover = NEXT_BLKP(prev_bp);
+            }
+
+            /*
+             * block 시작 주소가 왼쪽으로 이동했으므로
+             * 기존 bp가 아니라 prev_bp를 반환한다.
+             */
+            return prev_bp;
+        }
+
+        /*
+         * 이전 block과 다음 block이 모두 free이고,
+         * 세 block을 합친 크기가 요청 크기 이상이면 양쪽을 함께 흡수한다.
+         *
+         *   확장 전:
+         *     [왼쪽 FREE][현재 ALLOC][오른쪽 FREE]
+         *
+         *   확장 후:
+         *     [새 ALLOC][남은 FREE]
+         *
+         * block 시작 주소가 prev_bp로 이동하므로 기존 payload도
+         * 겹침을 허용하는 memmove()로 왼쪽으로 옮겨야 한다.
+         */
+        if (!GET_ALLOC(HDRP(prev_bp))
+            && !GET_ALLOC(HDRP(next_bp))
+            && GET_SIZE(HDRP(prev_bp))
+                   + old_asize
+                   + GET_SIZE(HDRP(next_bp)) >= asize) {
+            /* 이전 + 현재 + 다음 block을 합친 전체 크기 */
+            size_t combined_size = GET_SIZE(HDRP(prev_bp))
+                                 + old_asize
+                                 + GET_SIZE(HDRP(next_bp));
+
+            /* 요청 크기만큼 사용하고 남는 크기 */
+            size_t remainder = combined_size - asize;
+
+            /*
+             * metadata를 변경하기 전에 기존 payload를 새 시작 주소로 옮긴다.
+             * 원본과 목적지 범위가 겹칠 수 있으므로 memmove()를 사용한다.
+             */
+            memmove(prev_bp, bp, old_asize - DSIZE);
+
+            if (remainder >= 2 * DSIZE) {
+                /*
+                 * 16바이트 이상 남으면 앞쪽은 allocated block,
+                 * 뒤쪽은 하나의 free block으로 분할한다.
+                 */
+
+                /* 앞쪽 allocated block의 Header/Footer */
+                PUT(HDRP(prev_bp), PACK(asize, 1));
+                PUT(FTRP(prev_bp), PACK(asize, 1));
+
+                /*
+                 * free Header는 새 allocated block 바로 뒤에 기록한다.
+                 * free Footer는 합쳐진 전체 영역의 마지막에 기록한다.
+                 */
+                PUT(HDRP(prev_bp) + asize, PACK(remainder, 0));
+                PUT(HDRP(prev_bp) + combined_size - WSIZE,
+                    PACK(remainder, 0));
+            }
+            else {
+                /*
+                 * 남는 공간이 16바이트보다 작으면 분할하지 않고
+                 * 합쳐진 전체 공간을 allocated block으로 사용한다.
+                 */
+                PUT(HDRP(prev_bp), PACK(combined_size, 1));
+                PUT(HDRP(prev_bp) + combined_size - WSIZE,
+                    PACK(combined_size, 1));
+            }
+
+            /*
+             * rover가 병합 전 경계 중 하나를 가리켜 새 block 내부에
+             * 놓였다면 새 allocated block 다음의 유효한 경계로 이동한다.
+             *
+             * 분할했다면 새 free block을 가리키고,
+             * 분할하지 않았다면 합쳐진 block의 다음 block을 가리킨다.
+             */
+            if (rover
+                && (char *)prev_bp < rover
+                && rover < (char *)prev_bp + combined_size) {
+                rover = NEXT_BLKP(prev_bp);
+            }
+
+            /* block 시작 주소가 왼쪽으로 이동했으므로 prev_bp 반환 */
+            return prev_bp;
+        }
+
+
         /*
          * 오른쪽 block만으로 제자리 확장이 불가능한 경우:
          * 새 block을 할당하고 기존 payload를 복사한 뒤 기존 block을 해제한다.
